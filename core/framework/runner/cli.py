@@ -370,6 +370,25 @@ def register_commands(subparsers: argparse._SubParsersAction) -> None:
     )
     setup_creds_parser.set_defaults(func=cmd_setup_credentials)
 
+    # login command
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Log in to the Aden platform",
+        description="Authenticate with the Aden platform by storing your API key.",
+    )
+    login_parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="Aden API key (if not provided, you will be prompted)",
+    )
+    login_parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip verification of the API key against the Aden platform",
+    )
+    login_parser.set_defaults(func=cmd_login)
+
 
 def _load_resume_state(
     agent_path: str, session_id: str, checkpoint_id: str | None = None
@@ -1915,3 +1934,168 @@ def cmd_setup_credentials(args: argparse.Namespace) -> int:
 
     result = session.run_interactive()
     return 0 if result.success else 1
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Log in to the Aden platform by storing your API key."""
+    import getpass
+    import os
+
+    # ANSI color helpers (disabled when not a TTY)
+    use_color = sys.stdout.isatty()
+    GREEN = "\033[0;32m" if use_color else ""
+    YELLOW = "\033[1;33m" if use_color else ""
+    CYAN = "\033[0;36m" if use_color else ""
+    BOLD = "\033[1m" if use_color else ""
+    RED = "\033[0;31m" if use_color else ""
+    NC = "\033[0m" if use_color else ""
+
+    print()
+    print(f"{BOLD}Aden Platform Login{NC}")
+    print(f"{YELLOW}{'=' * 40}{NC}")
+    print()
+
+    # Use key from --api-key flag, or already-set env var, or prompt the user
+    api_key = getattr(args, "api_key", None) or os.environ.get("ADEN_API_KEY", "")
+
+    if not api_key:
+        print("Enter your Aden API key to authenticate.")
+        print(f"{CYAN}Get one at:{NC} https://hive.adenhq.com")
+        print()
+        try:
+            api_key = getpass.getpass("ADEN_API_KEY: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{YELLOW}Login cancelled.{NC}")
+            return 1
+
+    if not api_key:
+        print(f"{RED}No API key provided. Login aborted.{NC}")
+        return 1
+
+    # Optional: verify the key against the Aden platform
+    if not getattr(args, "no_verify", False):
+        print("\nVerifying API key...")
+        verified = _verify_aden_api_key(api_key)
+        if verified is False:
+            print(f"{RED}✗ API key verification failed.{NC}")
+            print("  The key may be invalid or the Aden platform may be unreachable.")
+            try:
+                proceed = input("Continue saving anyway? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 1
+            if proceed != "y":
+                return 1
+        elif verified is True:
+            print(f"{GREEN}✓ API key verified.{NC}")
+        # None means verification was skipped (e.g. httpx not available)
+
+    # Export to the current session
+    os.environ["ADEN_API_KEY"] = api_key
+
+    # Persist to shell config (~/.bashrc / ~/.zshrc)
+    saved_path = _save_aden_api_key_to_shell_config(api_key)
+
+    print()
+    print(f"{GREEN}✓ Logged in successfully.{NC}")
+    print(f"{GREEN}✓ ADEN_API_KEY exported to current session.{NC}")
+    if saved_path:
+        print(f"{GREEN}✓ ADEN_API_KEY saved to {saved_path}{NC}")
+        print(f"  Reload your shell or run: {CYAN}source {saved_path}{NC}")
+    else:
+        print(f"{YELLOW}  To persist across sessions, add this to your shell config:{NC}")
+        print("  echo 'export ADEN_API_KEY=\"$ADEN_API_KEY\"' >> ~/.bashrc  # or ~/.zshrc")
+    print()
+    return 0
+
+
+def _verify_aden_api_key(api_key: str) -> bool | None:
+    """Verify an Aden API key by calling the platform health endpoint.
+
+    Returns:
+        True if the key is valid, False if it is invalid,
+        None if the check could not be performed (e.g. network unavailable).
+    """
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                "https://api.adenhq.com/v1/credentials",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if response.status_code == 200:
+                return True
+            if response.status_code in (401, 403):
+                return False
+            # Any other status (e.g. 5xx) — treat as inconclusive
+            return None
+    except Exception:
+        return None
+
+
+def _save_aden_api_key_to_shell_config(api_key: str) -> str | None:
+    """Save ADEN_API_KEY to the user's shell config file.
+
+    Tries the aden_tools helper first; falls back to a direct file write.
+
+    Returns:
+        The path of the config file that was updated, or None on failure.
+    """
+    # Try aden_tools helper (available when aden_tools package is installed)
+    try:
+        from aden_tools.credentials.shell_config import add_env_var_to_shell_config
+
+        success, config_path = add_env_var_to_shell_config(
+            "ADEN_API_KEY",
+            api_key,
+            comment="Aden Platform API key (set by `hive login`)",
+        )
+        if success:
+            return config_path
+    except Exception:
+        pass
+
+    # Fallback: write directly to ~/.zshrc or ~/.bashrc
+    import os
+    from pathlib import Path
+
+    home = Path.home()
+    shell = os.environ.get("SHELL", "")
+    if "zsh" in shell:
+        config_file = home / ".zshrc"
+    else:
+        config_file = home / ".bashrc"
+
+    export_line = f'\nexport ADEN_API_KEY="{api_key}"  # Added by `hive login`\n'
+
+    try:
+        # Check if already set to avoid duplicates
+        if config_file.exists():
+            existing = config_file.read_text()
+            if "ADEN_API_KEY" in existing:
+                # Replace the existing export line
+                import re
+
+                updated = re.sub(
+                    r"^export ADEN_API_KEY=.*$",
+                    export_line.strip(),
+                    existing,
+                    flags=re.MULTILINE,
+                )
+                if updated == existing:
+                    # Pattern didn't match (different format) — append instead
+                    config_file.write_text(existing + export_line)
+                else:
+                    config_file.write_text(updated)
+            else:
+                with config_file.open("a") as f:
+                    f.write(export_line)
+        else:
+            config_file.write_text(export_line)
+        return str(config_file)
+    except OSError:
+        return None
